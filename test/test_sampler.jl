@@ -6,6 +6,7 @@
 # right posterior on problems whose answers are known analytically.
 
 using LinearAlgebra, Random, Statistics, Distributions, StableRNGs
+using LogExpFunctions: logsumexp
 
 identity_prior(x) = x
 
@@ -212,4 +213,46 @@ end
     # Before any samples exist there is nothing to draw, and it must not throw.
     s0 = Sampler(x -> x, x -> 0.0; n_dim = 2, n_live = 50, seed = 0)
     @test Nautilus.print_live_display(s0; io = IOBuffer()) == 0
+end
+
+@testset "sampler: one dimension" begin
+    # The Python refuses n_dim < 2 outright. That guard is inherited, not algorithmic, and is
+    # not reproduced here — see the note in the Sampler constructor.
+    @test_throws ArgumentError Sampler(identity_prior, x -> 0.0; n_dim = 0)
+
+    # A Gaussian well inside the unit interval: Z = 1 - 2Φ(-5), so log Z is -5.7e-7.
+    d = Normal(0.5, 0.1)
+    for seed in 0:2
+        s = Sampler(identity_prior, x -> logpdf(d, x[1]);
+                    n_dim = 1, n_live = 400, n_networks = 1, seed)
+        @test run!(s; f_live = 0.05, n_eff = 2000)
+        @test isapprox(log_z(s), 0.0; atol = 0.05)
+
+        points, log_w, _ = posterior(s)
+        @test size(points, 2) == 1
+        w = exp.(log_w); w ./= sum(w)
+        mu = sum(points[:, 1] .* w)
+        @test isapprox(mu, 0.5; atol = 0.01)
+        @test isapprox(sqrt(sum(w .* (points[:, 1] .- mu) .^ 2)), 0.1; atol = 0.01)
+    end
+
+    # Two narrow, well-separated peaks: the ellipsoid union has to split in 1-D too, and the
+    # evidence is still exactly 1 because the mixture is normalised and sits inside the range.
+    like = x -> logsumexp([logpdf(Normal(0.25, 0.01), x[1]),
+                           logpdf(Normal(0.75, 0.01), x[1])]) - log(2)
+    s = Sampler(identity_prior, like; n_dim = 1, n_live = 500, n_networks = 1, seed = 0)
+    run!(s; f_live = 0.02, n_eff = 2000)
+    @test isapprox(log_z(s), 0.0; atol = 0.1)
+
+    # Both peaks must be represented, not just the one the sampler happened to find first.
+    points, log_w, _ = posterior(s)
+    w = exp.(log_w); w ./= sum(w)
+    lo = sum(w[points[:, 1] .< 0.5])
+    @test 0.35 < lo < 0.65
+
+    # And with the network disabled, i.e. plain multi-ellipsoidal sampling in 1-D.
+    s0 = Sampler(identity_prior, x -> logpdf(d, x[1]);
+                 n_dim = 1, n_live = 400, n_networks = 0, seed = 0)
+    run!(s0; f_live = 0.05, n_eff = 1000)
+    @test isapprox(log_z(s0), 0.0; atol = 0.05)
 end

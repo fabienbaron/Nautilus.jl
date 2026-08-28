@@ -95,7 +95,18 @@ function Sampler(prior, likelihood; n_dim::Union{Nothing,Integer} = nothing,
             throw(ArgumentError("'n_dim' is required when 'prior' is a callable"))
         Int(n_dim)
     end
-    d <= 1 && throw(ArgumentError("cannot run Nautilus with fewer than 2 parameters, got $d"))
+    # The Python raises unconditionally below two dimensions (sampler.py:265), a guard added
+    # in its v0.2.0 rewrite with no rationale in the commit, the changelog or the docs. It is
+    # not algorithmic: bypassing it there runs a 1-D problem to a correct evidence, and every
+    # bound here handles a single dimension cleanly. So only a degenerate zero is refused.
+    #
+    # 1-D nonetheless has no need of this method. The posterior can be integrated on a grid to
+    # machine precision for a few hundred likelihood calls, where nested sampling spends
+    # thousands to reach ~1%, and the neural bound has nothing to learn: the region above a
+    # threshold is a union of intervals, which the ellipsoid union already represents exactly.
+    # It is supported because a one-parameter fit is a real thing to want, not because it is
+    # the right tool for one.
+    d < 1 && throw(ArgumentError("need at least one parameter, got $d"))
 
     pd = pass_dict === nothing ? (prior isa Prior) : pass_dict
     pd && !(prior isa Prior) &&
