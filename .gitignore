@@ -1,0 +1,4 @@
+# A library pins nothing: the Manifest is resolved by whoever uses the package.
+Manifest.toml
+LocalPreferences.toml
+*.cov
