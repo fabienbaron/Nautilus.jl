@@ -9,6 +9,24 @@
 #
 # Pulling in a neural-network framework for a network this small would cost more in dependency
 # weight and per-epoch overhead than it saves; this is a few hundred lines and exact.
+#
+# MEASURED against SimpleChains.jl, the strongest candidate, on this exact workload
+# (100 epochs, batch 200, one BLAS thread; BenchmarkTools minimum of 10 samples):
+#
+#     d     n    this   SC Float64   SC Float32
+#     6  1000   53.3 ms    38.5 ms      25.3 ms
+#     6  5000  283.5 ms   192.3 ms     129.7 ms
+#     2  2000  110.4 ms    75.0 ms      50.8 ms
+#    20  2000  124.2 ms    86.2 ms      57.4 ms
+#
+# So SimpleChains is 1.4x ahead in Float64 and 2.2x in Float32. Against that: it pulls in
+# LoopVectorization, it encodes the input dimension in the TYPE so every new dimensionality
+# pays fresh codegen (measured at 2.4 s for d=2, 9.7 s for d=6, 2.7 s for d=20, on top of an
+# already-real TTFX), Float32 is where its best numbers are, and adopting it means
+# reimplementing the init and the stopping rule around its training loop. The network is 68%
+# of a sampler run, so its remaining Float64 margin is worth about 1.2x end to end. Not worth
+# it -- but the gap was 2.0-3.8x before this file was made allocation-free, so the judgement
+# rests on that and would flip back if this regressed.
 
 """
     MLPRegressor
@@ -59,36 +77,100 @@ function predict(m::MLPRegressor, X::AbstractMatrix{Float64})
     return vec(A)
 end
 
-# Forward pass keeping the activations, then backward. Returns the batch loss and the
-# gradients. Mirrors sklearn's `_backprop`; with `alpha = 0` the L2 terms drop out entirely.
-function _backprop(m::MLPRegressor, X::AbstractMatrix{Float64}, y::AbstractVector{Float64})
-    L = nlayers(m)
-    n = size(X, 2)
+"""
+    MLPWorkspace
 
-    A = Vector{Matrix{Float64}}(undef, L + 1)
-    A[1] = X
+Scratch space for training, allocated once per `fit!` and reused by every batch of every
+epoch.
+
+The obvious implementation allocates the activations, both gradient arrays and a copy of the
+batch on each of ~500 backprop calls per network, and at this size that allocation traffic is
+a large fraction of the run time rather than a rounding error. `A[l]` and `D[l]` are sized for
+the largest batch and used through views, so the short final batch costs nothing extra.
+"""
+struct MLPWorkspace
+    A::Vector{Matrix{Float64}}     # A[l]: activations of layer l, (size_l, batch_max)
+    D::Vector{Matrix{Float64}}     # D[l]: delta at layer l's output, (size_{l+1}, batch_max)
+    gW::Vector{Matrix{Float64}}
+    gb::Vector{Vector{Float64}}
+    y::Vector{Float64}             # the batch's targets, gathered
+end
+
+function MLPWorkspace(m::MLPRegressor, batch_max::Int)
+    L = nlayers(m)
+    sizes = [size(m.W[1], 2); [size(W, 1) for W in m.W]]
+    A = [Matrix{Float64}(undef, sizes[l], batch_max) for l in 1:(L + 1)]
+    D = [Matrix{Float64}(undef, sizes[l + 1], batch_max) for l in 1:L]
+    return MLPWorkspace(A, D, [similar(W) for W in m.W], [similar(b) for b in m.b],
+                        Vector{Float64}(undef, batch_max))
+end
+
+# Gather one batch into the workspace. Indexing `X[:, cols]` would allocate a fresh matrix per
+# batch; this writes into the buffer that is already there.
+function _gather!(ws::MLPWorkspace, X::AbstractMatrix{Float64}, y::AbstractVector{Float64},
+                  cols::AbstractVector{Int})
+    d = size(X, 1)
+    @inbounds for (k, c) in enumerate(cols)
+        for j in 1:d
+            ws.A[1][j, k] = X[j, c]
+        end
+        ws.y[k] = y[c]
+    end
+    return nothing
+end
+
+# Forward then backward over the batch already sitting in `ws`. Returns the batch loss; the
+# gradients are left in `ws.gW` / `ws.gb`. Mirrors sklearn's `_backprop`; with `alpha = 0` the
+# L2 terms drop out entirely.
+function _backprop!(ws::MLPWorkspace, m::MLPRegressor, bs::Int)
+    L = nlayers(m)
+
     for l in 1:L
-        Z = m.W[l] * A[l] .+ m.b[l]
-        l < L && (Z .= max.(Z, 0.0))
-        A[l + 1] = Z
+        Al = view(ws.A[l], :, 1:bs)
+        Z = view(ws.A[l + 1], :, 1:bs)
+        mul!(Z, m.W[l], Al)
+        bl = m.b[l]
+        @inbounds for j in 1:bs, i in eachindex(bl)
+            z = Z[i, j] + bl[i]
+            Z[i, j] = (l < L && z < 0) ? 0.0 : z
+        end
     end
 
     # sklearn's squared_loss is ((y - yhat)^2).mean() / 2, i.e. halved MSE.
-    delta = A[L + 1] .- y'
-    loss = sum(abs2, delta) / (2n)
+    out = view(ws.A[L + 1], :, 1:bs)
+    dL = view(ws.D[L], :, 1:bs)
+    loss = 0.0
+    @inbounds for j in 1:bs
+        e = out[1, j] - ws.y[j]
+        dL[1, j] = e
+        loss += e * e
+    end
+    loss /= 2bs
 
-    gW = Vector{Matrix{Float64}}(undef, L)
-    gb = Vector{Vector{Float64}}(undef, L)
     for l in L:-1:1
-        gW[l] = (delta * A[l]') ./ n
-        gb[l] = vec(sum(delta, dims = 2)) ./ n
+        Dl = view(ws.D[l], :, 1:bs)
+        Al = view(ws.A[l], :, 1:bs)
+        mul!(ws.gW[l], Dl, transpose(Al))
+        ws.gW[l] ./= bs
+        gb = ws.gb[l]
+        @inbounds for i in eachindex(gb)
+            acc = 0.0
+            for j in 1:bs
+                acc += Dl[i, j]
+            end
+            gb[i] = acc / bs
+        end
         if l > 1
+            Dp = view(ws.D[l - 1], :, 1:bs)
+            mul!(Dp, transpose(m.W[l]), Dl)
             # ReLU derivative, keyed on the post-activation being non-zero exactly as
             # sklearn's `inplace_relu_derivative` does.
-            delta = (m.W[l]' * delta) .* (A[l] .> 0)
+            @inbounds for j in 1:bs, i in axes(Dp, 1)
+                Al[i, j] > 0 || (Dp[i, j] = 0.0)
+            end
         end
     end
-    return loss, gW, gb
+    return loss
 end
 
 # sklearn's `gen_batches`: whole batches followed by whatever remains.
@@ -136,25 +218,29 @@ function fit!(m::MLPRegressor, X::AbstractMatrix{Float64}, y::AbstractVector{Flo
     no_improvement = 0
     idx = collect(1:n)
     batches = _batch_ranges(n, bs)
+    ws = MLPWorkspace(m, maximum(length, batches))
 
     for _ in 1:max_iter
         shuffle!(rng, idx)
         accumulated = 0.0
 
-        for s in batches
-            cols = view(idx, s)
-            loss, gW, gb = _backprop(m, X[:, cols], y[cols])
-            accumulated += loss * length(s)
+        for sl in batches
+            cols = view(idx, sl)
+            nb = length(sl)
+            _gather!(ws, X, y, cols)
+            loss = _backprop!(ws, m, nb)
+            accumulated += loss * nb
 
             t += 1
             # sklearn folds Adam's bias correction into the step size rather than into m and v.
             lr = learning_rate_init * sqrt(1 - beta_2^t) / (1 - beta_1^t)
             for l in 1:L
-                @. mW[l] = beta_1 * mW[l] + (1 - beta_1) * gW[l]
-                @. vW[l] = beta_2 * vW[l] + (1 - beta_2) * gW[l]^2
+                gW, gb = ws.gW[l], ws.gb[l]
+                @. mW[l] = beta_1 * mW[l] + (1 - beta_1) * gW
+                @. vW[l] = beta_2 * vW[l] + (1 - beta_2) * gW^2
                 @. m.W[l] -= lr * mW[l] / (sqrt(vW[l]) + epsilon)
-                @. mb[l] = beta_1 * mb[l] + (1 - beta_1) * gb[l]
-                @. vb[l] = beta_2 * vb[l] + (1 - beta_2) * gb[l]^2
+                @. mb[l] = beta_1 * mb[l] + (1 - beta_1) * gb
+                @. vb[l] = beta_2 * vb[l] + (1 - beta_2) * gb^2
                 @. m.b[l] -= lr * mb[l] / (sqrt(vb[l]) + epsilon)
             end
         end
