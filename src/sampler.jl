@@ -10,8 +10,7 @@
 # estimate -- that is the "importance" in importance nested sampling, and it is why the
 # posterior sample is so much larger than a classical nested sampler's.
 #
-# Not ported (deliberately, see the plan): HDF5 checkpointing and resume, blobs, and periodic
-# parameters.
+# Not ported (deliberately, see the plan): HDF5 checkpointing and resume, and blobs.
 
 const _STATUS_COLS = ("Status", "Bounds", "Ellipses", "Networks", "Calls", "f_live", "N_eff", "log Z")
 const _STATUS_WIDTHS = (9, 6, 8, 8, 8, 6, 5, 7)
@@ -25,12 +24,14 @@ mutable struct Sampler{P,L}
     enlarge_per_dim::Float64
     n_points_min::Int
     split_threshold::Float64
+    periodic::Vector{Int}
     n_networks::Int
     n_batch::Int
     n_like_new_bound::Int
     vectorized::Bool
     pass_dict::Bool
     threaded::Bool
+    threaded_training::Bool
     rng::AbstractRNG
 
     n_like::Int
@@ -72,21 +73,34 @@ docstring says 3000, but the code says 2000 and the code is what runs.
   * `n_like_new_bound = 10 * n_live` — likelihood calls before a new bound is forced.
   * `n_points_min = n_dim + 50` — minimum points per ellipsoid.
   * `enlarge_per_dim = 1.1`, `split_threshold = 100`, `n_networks = 4`.
+  * `periodic = nothing` — the parameters that wrap around, such as angles, as 1-based
+    indices into the unit cube (the Python's are 0-based). With a [`Prior`](@ref) these count
+    only the free parameters, in the order they were added. The bounds then treat 0 and 1 as
+    the same point, so a mode across the seam is not split in two. The prior on such a
+    parameter should be uniform over one period, e.g. `(0, 360)`. The posterior still comes
+    back in that range, so a mode at 0° appears at both ends, and its mean must be taken as a
+    circular mean.
   * `vectorized = false` — if true, `likelihood` receives all points at once.
   * `threaded = false` — evaluate the likelihood, and draw from the bounds, on all available
     threads. **Opt-in, because it requires a thread-safe `likelihood`**: one that closes over
     a shared preallocated workspace (a common pattern in model-fitting code) will silently
     corrupt its results. Reproducibility then holds per seed *and* thread count.
+  * `threaded_training = true` — train each bound's networks on separate threads. Set it to
+    false when you run several samplers in parallel yourself, e.g. from `Threads.@threads`.
+    The result is identical either way.
   * `pass_dict` — pass parameters as a `Dict`; defaults to true for a `Prior`, false otherwise.
 """
 function Sampler(prior, likelihood; n_dim::Union{Nothing,Integer} = nothing,
                  n_live::Integer = 2000, n_update::Union{Nothing,Integer} = nothing,
                  enlarge_per_dim::Real = 1.1, n_points_min::Union{Nothing,Integer} = nothing,
-                 split_threshold::Real = 100, n_networks::Integer = 4,
+                 split_threshold::Real = 100,
+                 periodic::Union{Nothing,AbstractVector{<:Integer}} = nothing,
+                 n_networks::Integer = 4,
                  n_batch::Union{Nothing,Integer} = nothing,
                  n_like_new_bound::Union{Nothing,Integer} = nothing,
                  vectorized::Bool = false, pass_dict::Union{Nothing,Bool} = nothing,
-                 threaded::Bool = false, seed::Union{Nothing,Integer} = nothing)
+                 threaded::Bool = false, threaded_training::Bool = true,
+                 seed::Union{Nothing,Integer} = nothing)
 
     d = if prior isa Prior
         dimensionality(prior)
@@ -108,6 +122,11 @@ function Sampler(prior, likelihood; n_dim::Union{Nothing,Integer} = nothing,
     # the right tool for one.
     d < 1 && throw(ArgumentError("need at least one parameter, got $d"))
 
+    per = periodic === nothing ? Int[] : collect(Int, periodic)
+    all(in(1:d), per) ||
+        throw(ArgumentError("'periodic' indices must lie in 1:$d, got $per"))
+    allunique(per) || throw(ArgumentError("'periodic' has repeated indices: $per"))
+
     pd = pass_dict === nothing ? (prior isa Prior) : pass_dict
     pd && !(prior isa Prior) &&
         throw(ArgumentError("'pass_dict' requires a Prior, not a callable"))
@@ -120,7 +139,7 @@ function Sampler(prior, likelihood; n_dim::Union{Nothing,Integer} = nothing,
 
     return Sampler{typeof(prior),typeof(likelihood)}(
         prior, likelihood, d, Int(n_live), nu, Float64(enlarge_per_dim), npm,
-        Float64(split_threshold), Int(n_networks), nb, nlnb, vectorized, pd, threaded, rng,
+        Float64(split_threshold), per, Int(n_networks), nb, nlnb, vectorized, pd, threaded, threaded_training, rng,
         0, false, false,
         Union{UnitCube,NautilusBound}[], Matrix{Float64}[], Vector{Float64}[],
         Int[], Int[], Float64[], Float64[], Float64[], Float64[], Int[], Int[],
@@ -132,11 +151,65 @@ end
 # --------------------------------------------------------------------------------------------
 
 """
-    evaluate_likelihood(s, points) -> Vector{Float64}
+    LikelihoodError(point, err)
 
-Map `points` (unit hypercube, one per column) through the prior and evaluate the likelihood.
-Increments the call counter.
+Thrown when the likelihood throws. `point` is the input it was given, in physical
+coordinates, either a vector or a `Dict`. The original exception and its backtrace are
+shown under "caused by" (see `current_exceptions`), and `err` holds that exception.
 """
+struct LikelihoodError <: Exception
+    point::Any
+    err::Any
+end
+
+function Base.showerror(io::IO, e::LikelihoodError)
+    print(io, "LikelihoodError: the likelihood threw a ", nameof(typeof(e.err)), " at ")
+    show(io, e.point)
+end
+
+# Call the likelihood on one point, so that an exception names the point that caused it.
+function _call_likelihood(f, x)
+    try
+        return Float64(f(x))
+    catch err
+        throw(LikelihoodError(x, err))
+    end
+end
+
+# One point in physical coordinates, as the likelihood would see it. Only used to build
+# error messages, so it does not need to be fast.
+function _physical_point(s::Sampler, points::AbstractMatrix, i::Int)
+    u = points[:, i:i]
+    s.prior isa Prior && return s.pass_dict ? Dict(k => v[1] for (k, v) in
+                                                   unit_to_dictionary(s.prior, u)) :
+                                              vec(unit_to_physical(s.prior, u))
+    return vec(s.vectorized ? s.prior(u) : s.prior(vec(u)))
+end
+
+# Map NaN to -Inf in place, and refuse +Inf.
+#
+# NaN cannot be left in: Julia's `sortperm` orders NaN *after* every number, so a NaN log L
+# would rank as the best point the run has seen. It could then become the next bound's
+# threshold, and every comparison against that threshold is false. Treating it as -Inf is
+# what the caller almost always means (an invalid region), and it gives the same evidence as
+# a likelihood that returns -Inf there. A +Inf log L means the evidence itself is infinite,
+# so there is no sensible way to go on.
+function _sanitize_log_l!(log_l::Vector{Float64}, s::Sampler, points::AbstractMatrix)
+    for i in eachindex(log_l)
+        v = log_l[i]
+        if isnan(v)
+            @warn("The likelihood returned NaN; treating it as -Inf. Return -Inf yourself " *
+                  "to silence this warning.", point = _physical_point(s, points, i),
+                  maxlog = 1)
+            log_l[i] = -Inf
+        elseif v == Inf
+            throw(DomainError(_physical_point(s, points, i),
+                              "the log-likelihood is +Inf at this point"))
+        end
+    end
+    return log_l
+end
+
 # Apply `f` to each index, on all threads when asked. One helper so the serial and threaded
 # paths cannot drift apart.
 function _map_indices(f, n::Int, threaded::Bool)
@@ -150,6 +223,22 @@ function _map_indices(f, n::Int, threaded::Bool)
     return Float64[f(i) for i in 1:n]
 end
 
+"""
+    evaluate_likelihood(s, points) -> Vector{Float64}
+
+Map `points` (unit hypercube, one per column) through the prior and evaluate the likelihood.
+Increments the call counter.
+
+What the likelihood may return:
+
+  * `-Inf` marks a point as excluded. A run then gives the evidence of the problem
+    truncated to the region where the likelihood is finite.
+  * `NaN` is treated as `-Inf`, with a one-time warning.
+  * `+Inf` throws a `DomainError` that names the point.
+  * If the likelihood throws, the exception is rethrown as a [`LikelihoodError`](@ref)
+    naming the point. With `vectorized = true` there is no single point to name, so the
+    exception propagates unchanged.
+"""
 function evaluate_likelihood(s::Sampler, points::AbstractMatrix{Float64})
     n = size(points, 2)
     n == 0 && return Float64[]
@@ -157,7 +246,8 @@ function evaluate_likelihood(s::Sampler, points::AbstractMatrix{Float64})
     log_l = if s.prior isa Prior && s.pass_dict
         dict = unit_to_dictionary(s.prior, points)
         s.vectorized ? s.likelihood(dict) :
-            _map_indices(i -> s.likelihood(Dict(k => v[i] for (k, v) in dict)), n, s.threaded)
+            _map_indices(i -> _call_likelihood(s.likelihood, Dict(k => v[i] for (k, v) in dict)),
+                         n, s.threaded)
     else
         phys = if s.prior isa Prior
             unit_to_physical(s.prior, points)
@@ -167,11 +257,13 @@ function evaluate_likelihood(s::Sampler, points::AbstractMatrix{Float64})
             reduce(hcat, (s.prior(points[:, i]) for i in 1:n))
         end
         s.vectorized ? s.likelihood(phys) :
-            _map_indices(i -> s.likelihood(phys[:, i]), n, s.threaded)
+            _map_indices(i -> _call_likelihood(s.likelihood, phys[:, i]), n, s.threaded)
     end
 
     s.n_like += n
-    return Vector{Float64}(log_l)
+    # The constructor copies, so sanitising never writes into an array the caller's
+    # vectorized likelihood still owns.
+    return _sanitize_log_l!(Vector{Float64}(log_l), s, points)
 end
 
 # --------------------------------------------------------------------------------------------
@@ -375,6 +467,29 @@ function sample_shell(s::Sampler, index::Int; transfer::Bool = false)
     return points, n_bound, idx_t
 end
 
+# Warn when the points pile up against the edge of the unit cube, i.e. the posterior wants
+# to go past the prior range, or a prior transform is losing precision there. Port of the
+# check upstream added in #82 (sampler.py:1036), with the same thresholds. Like upstream it
+# looks at every stored point, not only the live set. Unlike upstream it skips periodic
+# dimensions, where 0 and 1 are the same point and nothing is wrong. Each parameter warns at
+# most once per session, which is also what Python's default warning filter does.
+function _warn_prior_boundary(s::Sampler, pts::AbstractMatrix; fraction::Float64 = 0.1,
+                              distance::Float64 = 1e-5)
+    n = size(pts, 2)
+    n == 0 && return nothing
+    names = _param_names(s)
+    for j in 1:s.n_dim
+        j in s.periodic && continue
+        near = count(x -> x <= distance || x >= 1 - distance, @view pts[j, :])
+        if near / n > fraction
+            @warn("For parameter $(names[j]), the points are converging towards the prior " *
+                  "boundary. This may lead to numerical issues. Consider adjusting your prior.",
+                  _id = Symbol(:nautilus_prior_boundary_, j), maxlog = 1)
+        end
+    end
+    return nothing
+end
+
 """
     add_bound!(s; verbose=false) -> Bool
 
@@ -409,11 +524,14 @@ function add_bound!(s::Sampler; verbose::Bool = false)
         if all(ll .>= log_l_min)
             success = false
         else
+            _warn_prior_boundary(s, pts)
             bound = NautilusBound(pts, ll, log_l_min, log_v_live(s);
                                   enlarge_per_dim = s.enlarge_per_dim,
                                   n_points_min = s.n_points_min,
                                   split_threshold = s.split_threshold,
-                                  n_networks = s.n_networks, rng = s.rng)
+                                  periodic = s.periodic,
+                                  n_networks = s.n_networks,
+                                  threaded_training = s.threaded_training, rng = s.rng)
             sample(bound, 1000; return_points = false, threaded = s.threaded)
             if log_volume(bound) < log_volume(s.bounds[end])
                 push!(s.bounds, bound)
@@ -577,6 +695,9 @@ function _mode_ids(s::Sampler, unit::AbstractMatrix)
     (isempty(s.bounds) || !(s.bounds[end] isa NautilusBound)) && return ids
     nb = s.bounds[end].neural_bounds
     ells = isempty(nb) ? s.bounds[end].outer_bound.bounds : [b.outer_bound for b in nb]
+    # Those ellipsoids live in the bound's phase-shifted frame, not in the unit cube.
+    shift = s.bounds[end].shift
+    shift === nothing || (unit = transform(shift, unit))
     for (k, sub) in enumerate(ells)
         inb = in_bound(sub, unit)
         @inbounds for j in eachindex(ids)

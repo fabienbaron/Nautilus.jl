@@ -88,7 +88,9 @@ end
     log_z_true = log(sum(0.9 .* 0.1 .^ (0:99) .* exp.(1 .+ (0:99))))
 
     s = Sampler(identity_prior, like; n_dim = 2, n_live = 2000, n_networks = 1, seed = 0)
-    run!(s; f_live = 1e-6)
+    # The plateaus close in on x = 1, so the points really do pile up at the prior boundary,
+    # and upstream's boundary check (#82) rightly says so.
+    @test_logs (:warn, r"parameter x_1, the points are converging") match_mode = :any run!(s; f_live = 1e-6)
     @test isapprox(log_z(s), log_z_true; atol = 0.1)
     # Each bound must sit exactly on one plateau edge.
     @test s.shell_log_l_min[2:end] ≈ collect(2.0:(length(s.bounds)))
@@ -255,4 +257,122 @@ end
                  n_dim = 1, n_live = 400, n_networks = 0, seed = 0)
     run!(s0; f_live = 0.05, n_eff = 1000)
     @test isapprox(log_z(s0), 0.0; atol = 0.05)
+end
+
+@testset "sampler: non-finite likelihoods" begin
+    # Half the cube is excluded, so the evidence is that of the truncated problem: the
+    # Gaussian is centred on the cut, hence Z = 1/2.
+    mvn = MvNormal([0.5, 0.5], 0.01 * I(2))
+    cut(bad) = x -> x[1] < 0.5 ? bad : logpdf(mvn, x)
+    function run_cut(bad)
+        s = Sampler(identity_prior, cut(bad); n_dim = 2, n_live = 500, seed = 0)
+        run!(s; f_live = 0.1, n_eff = 5000)
+        return s
+    end
+
+    s_inf = run_cut(-Inf)
+    s_nan = @test_logs (:warn, r"returned NaN") match_mode = :any run_cut(NaN)
+    @test isapprox(log_z(s_inf), log(0.5); atol = 0.05)
+    # NaN is mapped to -Inf before anything else sees it, so the two runs are bit-identical.
+    @test log_z(s_nan) == log_z(s_inf)
+    @test s_nan.n_like == s_inf.n_like
+    @test !any(isnan, reduce(vcat, s_nan.log_l))
+
+    # A large negative sentinel is finite, so the run differs, but the evidence must not.
+    @test isapprox(log_z(run_cut(-1e300)), log(0.5); atol = 0.05)
+
+    # +Inf has no sensible meaning: the evidence would be infinite.
+    s = Sampler(identity_prior, cut(Inf); n_dim = 2, n_live = 100, seed = 0)
+    @test_throws DomainError run!(s)
+end
+
+@testset "sampler: a throwing likelihood names the point" begin
+    boom = x -> x[1] > 0.9 ? error("boom") : 0.0
+    s = Sampler(identity_prior, boom; n_dim = 2, n_live = 100, seed = 0)
+    err = try
+        run!(s); nothing
+    catch e
+        e
+    end
+    @test err isa LikelihoodError
+    @test err.point isa Vector{Float64} && err.point[1] > 0.9
+    @test err.err isa ErrorException && err.err.msg == "boom"
+    @test occursin("ErrorException", sprint(showerror, err))
+
+    # With a Prior and pass_dict, the point is the Dict the likelihood was given.
+    prior = Prior()
+    add_parameter!(prior, :a)
+    add_parameter!(prior, :b, (10, 20))
+    s = Sampler(prior, d -> d[:a] > 0.9 ? error("boom") : 0.0; n_live = 100, seed = 0)
+    err = try
+        run!(s); nothing
+    catch e
+        e
+    end
+    @test err isa LikelihoodError
+    @test err.point isa Dict && err.point[:a] > 0.9 && 10 <= err.point[:b] <= 20
+end
+
+@testset "sampler: periodic parameters" begin
+    # Port of tests/test_sampler.py::test_sampler_periodic: a Gaussian centred on the corner
+    # of the cube, which every dimension wraps around. Periodic, it is a single mode, and
+    # every bound after the cube must hold exactly one ellipsoid. (The Python's own assert
+    # for the non-periodic case is vacuous, `assert x == 1 if periodic else 4`, so that half
+    # is checked here as "more than one" instead.)
+    mvn = MvNormal([0.5, 0.5], 0.1 * I(2))
+    like = x -> logpdf(mvn, abs.(x .- 0.5))
+    # Each dimension contributes 2 (Φ(0) - Φ(-0.5/σ)), the mass of the folded Gaussian.
+    log_z_true = 2 * log(2 * (0.5 - cdf(Normal(), -0.5 / sqrt(0.1))))
+
+    s = Sampler(identity_prior, like; n_dim = 2, periodic = [1, 2], n_networks = 0, seed = 0)
+    run!(s)
+    @test all(length(b.neural_bounds) == 1 for b in s.bounds[2:end])
+    @test isapprox(log_z(s), log_z_true; atol = 0.05)
+
+    s0 = Sampler(identity_prior, like; n_dim = 2, n_networks = 0, seed = 0)
+    run!(s0)
+    @test any(length(b.neural_bounds) > 1 for b in s0.bounds[2:end])
+    @test isapprox(log_z(s0), log_z_true; atol = 0.05)      # correct either way, just slower
+
+    @test_throws ArgumentError Sampler(identity_prior, like; n_dim = 2, periodic = [3])
+    @test_throws ArgumentError Sampler(identity_prior, like; n_dim = 2, periodic = [1, 1])
+end
+
+@testset "sampler: von Mises mode across 0°/360°" begin
+    # The case from IMPROVEMENTS.md. With θ uniform on [0, 2π), the von Mises is normalised
+    # over one period, so its factor of the evidence is exactly 1/(2π).
+    kappa = 20.0
+    vm = VonMises(0.0, kappa)
+    prior = Prior()
+    add_parameter!(prior, :theta, (0, 2pi))
+    add_parameter!(prior, :x)
+    like = d -> logpdf(vm, rem2pi(d[:theta], RoundNearest)) + logpdf(Normal(0.5, 0.1), d[:x])
+    log_z_true = -log(2pi) + log(cdf(Normal(), 5) - cdf(Normal(), -5))
+
+    s = Sampler(prior, like; periodic = [1], n_live = 1000, seed = 0)
+    run!(s)
+    @test isapprox(log_z(s), log_z_true; atol = 0.05)
+    @test all(length(b.neural_bounds) == 1 for b in s.bounds[2:end])   # never split
+
+    points, log_w, _ = posterior(s)
+    w = exp.(log_w)
+    theta = points[:, 1]
+    @test all(0 .<= theta .< 2pi)
+    # A circular mean at 0, and the concentration of a von Mises with this kappa:
+    # E[cos θ] = I1(κ)/I0(κ), 0.97467 at κ = 20.
+    @test abs(atan(sum(w .* sin.(theta)), sum(w .* cos.(theta)))) < 0.02
+    @test isapprox(sum(w .* cos.(theta)), 0.97467; atol = 0.005)
+end
+
+@testset "sampler: warning at the prior boundary" begin
+    # Upstream #82. A mode pressed against x = 0 drags the points to within 1e-5 of the edge.
+    edge = x -> -0.5 * (x[1] / 1e-6)^2 - 0.5 * ((x[2] - 0.5) / 0.1)^2
+    s = Sampler(identity_prior, edge; n_dim = 2, n_live = 300, n_networks = 1, seed = 0)
+    @test_logs (:warn, r"parameter x_1, the points are converging") match_mode = :any run!(s; n_eff = 1000)
+
+    # On a periodic dimension 0 and 1 are the same point, so nothing is wrong and nothing warns.
+    seam = x -> -0.5 * (min(x[1], 1 - x[1]) / 1e-6)^2 - 0.5 * ((x[2] - 0.5) / 0.1)^2
+    s = Sampler(identity_prior, seam; n_dim = 2, n_live = 300, n_networks = 1, periodic = [1],
+                seed = 0)
+    @test_logs min_level = Base.CoreLogging.Warn run!(s; n_eff = 1000)
 end

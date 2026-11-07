@@ -12,8 +12,36 @@ struct NeuralNetworkEmulator
     networks::Vector{MLPRegressor}
 end
 
+# BLAS has one thread count for the whole process, so pinning it to 1 around training is
+# shared state. Saving and restoring it naively races when several samplers train at once:
+# the second saves the 1 the first has just set, the first then restores the full count
+# while the second is still training, and the second finally "restores" 1 and leaves the
+# process there for good. So the pin is reference-counted: the first trainer in saves the
+# count and pins, the last one out restores it.
+const _BLAS_PIN_LOCK = ReentrantLock()
+const _BLAS_PIN_COUNT = Ref(0)
+const _BLAS_SAVED_THREADS = Ref(1)
+
+function _with_single_blas_thread(f)
+    lock(_BLAS_PIN_LOCK) do
+        if _BLAS_PIN_COUNT[] == 0
+            _BLAS_SAVED_THREADS[] = BLAS.get_num_threads()
+            BLAS.set_num_threads(1)
+        end
+        _BLAS_PIN_COUNT[] += 1
+    end
+    try
+        return f()
+    finally
+        lock(_BLAS_PIN_LOCK) do
+            _BLAS_PIN_COUNT[] -= 1
+            _BLAS_PIN_COUNT[] == 0 && BLAS.set_num_threads(_BLAS_SAVED_THREADS[])
+        end
+    end
+end
+
 """
-    train_emulator(x, y; n_networks=4, hidden=(100, 50, 20), rng=nothing, kwargs...)
+    train_emulator(x, y; n_networks=4, hidden=(100, 50, 20), threaded_training=true, kwargs...)
 
 Train an ensemble on `x` (one point per column) against targets `y`.
 
@@ -21,13 +49,16 @@ Inputs are standardised per dimension first. `std` is taken with `corrected = fa
 numpy's `np.std`, whose default is the population standard deviation where Julia's default is
 the sample one.
 
-The ensemble members are independent, so they are trained on separate threads with BLAS pinned
-to one thread apiece — the direct analogue of the `threadpool_limits(limits=1)` wrapper the
-Python puts around each `fit` (neural.py:11).
+The ensemble members are independent, so by default they are trained on separate threads,
+with BLAS pinned to one thread for the duration. That is the analogue of the
+`threadpool_limits(limits=1)` wrapper the Python puts around each `fit` (neural.py:11).
+`threaded_training = false` trains them one after the other, for callers that already run
+several samplers in parallel. Each network has a fixed seed, so the trained ensemble is
+identical either way.
 """
 function train_emulator(x::AbstractMatrix{<:Real}, y::AbstractVector{<:Real};
                         n_networks::Int = 4, hidden::NTuple{N,Int} = (100, 50, 20),
-                        kwargs...) where {N}
+                        threaded_training::Bool = true, kwargs...) where {N}
     xf = Matrix{Float64}(x)
     yf = Vector{Float64}(y)
 
@@ -36,17 +67,20 @@ function train_emulator(x::AbstractMatrix{<:Real}, y::AbstractVector{<:Real};
     xn = (xf .- mu) ./ sc
 
     networks = Vector{MLPRegressor}(undef, n_networks)
-    n_blas = BLAS.get_num_threads()
-    BLAS.set_num_threads(1)
-    try
-        Threads.@threads for i in 1:n_networks
-            rng = Xoshiro(i - 1)                     # seeds 0 .. n_networks-1, as in Python
-            net = MLPRegressor(size(xn, 1), hidden, 1, rng)
-            fit!(net, xn, yf; rng, kwargs...)
-            networks[i] = net
+    function train(i)
+        rng = Xoshiro(i - 1)                         # seeds 0 .. n_networks-1, as in Python
+        net = MLPRegressor(size(xn, 1), hidden, 1, rng)
+        fit!(net, xn, yf; rng, kwargs...)
+        networks[i] = net
+    end
+    _with_single_blas_thread() do
+        if threaded_training
+            Threads.@threads for i in 1:n_networks
+                train(i)
+            end
+        else
+            foreach(train, 1:n_networks)
         end
-    finally
-        BLAS.set_num_threads(n_blas)
     end
 
     return NeuralNetworkEmulator(mu, sc, networks)

@@ -65,3 +65,39 @@ end
     @test n_net(nb) == 2
     @test n_ell(nb) >= 1
 end
+
+@testset "PhaseShift centres periodic dimensions" begin
+    # Port of tests/test_bounds.py::test_phase_shift: a cluster 0.1 wide, dropped anywhere on
+    # the circle and so often across the seam, must land in the middle of the cube.
+    rng = StableRNG(0)
+    for _ in 1:100
+        points = mod.(rand(rng, 2, 10) .* 0.1 .+ rand(rng, 2), 1)
+        shift = PhaseShift(points, [1])
+        moved = transform(shift, points)
+        @test 0.45 <= minimum(moved[1, :]) && maximum(moved[1, :]) <= 0.55
+        @test moved[2, :] == points[2, :]                  # non-periodic dimension untouched
+        @test isapprox(transform(shift, moved; inverse = true), points; rtol = 0, atol = 1e-12)
+    end
+end
+
+@testset "NautilusBound with a periodic dimension" begin
+    # One blob across the seam in x, centred in y. Without the shift it is two half-blobs
+    # at opposite edges of the cube.
+    rng = StableRNG(1)
+    points = rand(rng, 2, 4000)
+    wrapped = min.(points[1, :], 1 .- points[1, :])          # distance to the seam
+    log_l = -(wrapped .^ 2 .+ (points[2, :] .- 0.5) .^ 2) ./ (2 * 0.05^2)
+    log_l_min = quantile(log_l, 0.9)
+
+    nb = NautilusBound(points, log_l, log_l_min, log(0.1);
+                       periodic = [1], n_networks = 1, rng = StableRNG(0))
+    @test length(nb.neural_bounds) == 1                       # one blob, so one ellipsoid
+    drawn = sample(nb, 2000)
+    @test all(0 .<= drawn .< 1)                               # shifted back into the cube
+    @test all(in_bound(nb, drawn))
+    # Both edges of the seam are populated, i.e. the blob was not clipped to one side.
+    @test count(<(0.5), drawn[1, :]) > 500 && count(>(0.5), drawn[1, :]) > 500
+
+    plain = NautilusBound(points, log_l, log_l_min, log(0.1); n_networks = 1, rng = StableRNG(0))
+    @test length(plain.neural_bounds) >= 2
+end

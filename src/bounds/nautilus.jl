@@ -10,11 +10,13 @@
 # drawn from, split and trimmed only until its volume is within `split_threshold` of the
 # target. Sampling is therefore cheap and the acceptance test is sharp.
 #
-# The `periodic` / PhaseShift handling of the Python is not ported. It would enter here, as a
-# transform applied to `points` on the way in and inverted on the way out of `sample`.
+# With periodic parameters, everything above is built in a phase-shifted frame (see
+# periodic.jl). `in_bound` shifts its input into that frame, and the point cache filled by
+# `sample` is held in that frame and shifted back only when points are handed out.
 
 mutable struct NautilusBound
     n_dim::Int
+    shift::Union{Nothing,PhaseShift}
     neural_bounds::Vector{NeuralBound}
     outer_bound::UnionBound{UnitCubeEllipsoidMixture}
     rng::AbstractRNG
@@ -32,17 +34,27 @@ Port of `NautilusBound.compute` (nautilus.py:41).
 The outer union is split while it exceeds that target by more than
 `split_threshold * enlarge_per_dim^n_dim`, then, if it is still too large, sparse ellipsoids
 are trimmed away under the same criterion.
+
+`periodic` lists the dimensions (1-based) that wrap around. They are phase-shifted so that
+the widest gap between the points above the threshold falls on the 0/1 seam; `nothing` or an
+empty list turns this off.
 """
 function NautilusBound(points::AbstractMatrix{<:Real}, log_l::AbstractVector{<:Real},
                        log_l_min::Real, log_v_target::Real;
                        enlarge_per_dim::Real = 1.1,
                        n_points_min::Union{Nothing,Integer} = nothing,
-                       split_threshold::Real = 100, n_networks::Int = 4,
+                       split_threshold::Real = 100,
+                       periodic::Union{Nothing,AbstractVector{<:Integer}} = nothing,
+                       n_networks::Int = 4,
                        rng::AbstractRNG = Random.default_rng(), kwargs...)
     n_dim = size(points, 1)
     pts = Matrix{Float64}(points)
     ll = Vector{Float64}(log_l)
     above = ll .>= log_l_min
+
+    shift = (periodic === nothing || isempty(periodic)) ? nothing :
+            PhaseShift(pts[:, above], periodic)
+    shift === nothing || (pts = transform(shift, pts))
 
     # Inner union: ellipsoids that must not overlap, one neural bound each.
     inner = UnionBound(pts[:, above]; enlarge_per_dim, n_points_min,
@@ -70,10 +82,12 @@ function NautilusBound(points::AbstractMatrix{<:Real}, log_l::AbstractVector{<:R
         trim!(outer) || break
     end
 
-    return NautilusBound(n_dim, neural_bounds, outer, rng, zeros(n_dim, 0), 0, 0)
+    return NautilusBound(n_dim, shift, neural_bounds, outer, rng, zeros(n_dim, 0), 0, 0)
 end
 
 function in_bound(b::NautilusBound, points::AbstractMatrix)
+    shift = b.shift                 # a local, so the `nothing` check narrows its type
+    shift === nothing || (points = transform(shift, points))
     res = in_bound(b.outer_bound, points)
     if any(res)
         # Only points already inside the outer bound reach the networks: evaluating the
@@ -116,7 +130,8 @@ function sample(b::NautilusBound, n_points::Int = 100; return_points::Bool = tru
     return_points || return nothing
     out = b.points[:, 1:n_points]
     b.points = b.points[:, (n_points + 1):end]
-    return out
+    shift = b.shift
+    return shift === nothing ? out : transform(shift, out; inverse = true)
 end
 
 """

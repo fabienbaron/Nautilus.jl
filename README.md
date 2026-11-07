@@ -26,7 +26,11 @@ The method is fully ported and validated: the geometric bounds, the multi-ellips
 decomposition, the neural likelihood emulator and the sampler. `n_networks = 0` falls back to
 pure multi-ellipsoidal sampling.
 
-Deliberately **not** ported: HDF5 checkpointing and resume, blobs, and periodic parameters.
+Deliberately **not** ported: HDF5 checkpointing and resume, and blobs.
+
+Periodic parameters work as upstream does them: `Sampler(...; periodic = [3])` marks the
+third free parameter as wrapping around (indices are 1-based here, 0-based in the Python).
+Give it a uniform prior over one period, such as `(0, 360)`.
 
 Added beyond upstream:
 

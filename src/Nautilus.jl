@@ -29,14 +29,16 @@ include("emulator.jl")
 include("bounds/basic.jl")
 include("bounds/union.jl")
 include("bounds/neural.jl")
+include("bounds/periodic.jl")
 include("bounds/nautilus.jl")
 include("sampler.jl")
 include("precompile.jl")
 
 export Prior, add_parameter!, dimensionality, unit_to_physical,
        physical_to_dictionary, unit_to_dictionary
-export UnitCube, Ellipsoid, UnitCubeEllipsoidMixture, UnionBound, NeuralBound, NautilusBound
-export Sampler, run!, posterior, log_z, n_eff, eta, f_live,
+export UnitCube, Ellipsoid, UnitCubeEllipsoidMixture, UnionBound, NeuralBound, NautilusBound,
+       PhaseShift
+export Sampler, LikelihoodError, run!, posterior, log_z, n_eff, eta, f_live,
        shell_bound_occupation, set_discard_exploration!
 export in_bound, log_volume, n_ell, n_net, transform, transform_inverse, split!, trim!
 

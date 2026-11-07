@@ -71,3 +71,26 @@ end
     @test nb0.emulator === nothing
     @test in_bound(nb0, test_points) == in_bound(nb0.outer_bound, test_points)
 end
+
+@testset "emulator: serial training and the BLAS thread count" begin
+    rng = StableRNG(0)
+    x = rand(rng, 3, 400)
+    y = vec(sum(abs2, x .- 0.5, dims = 1))
+
+    # Each network has its own fixed seed, so threading cannot change the result.
+    a = Nautilus.train_emulator(x, y; n_networks = 3, max_iter = 50)
+    b = Nautilus.train_emulator(x, y; n_networks = 3, max_iter = 50, threaded_training = false)
+    @test Nautilus.predict(a, x) == Nautilus.predict(b, x)
+
+    # Concurrent trainers must leave the process-wide BLAS thread count as they found it.
+    n_blas = LinearAlgebra.BLAS.get_num_threads()
+    LinearAlgebra.BLAS.set_num_threads(3)
+    try
+        @sync for _ in 1:8
+            Threads.@spawn Nautilus.train_emulator(x, y; n_networks = 2, max_iter = 20)
+        end
+        @test LinearAlgebra.BLAS.get_num_threads() == 3
+    finally
+        LinearAlgebra.BLAS.set_num_threads(n_blas)
+    end
+end
